@@ -398,6 +398,65 @@ class MiningService:
                 raise ValueError("A referenced worker/equipment ID does not exist, or this ID is already used.") from None
         return row["id"]
 
+    def import_records(self, token, batches, update_existing=False, dry_run=True):
+        """Validate and import multiple datasets in one all-or-nothing transaction.
+
+        Preview uses the real database constraints then rolls back. Saving repeats
+        every check against current records. Account data cannot be bulk imported.
+        """
+        if not isinstance(batches, dict) or not batches:
+            raise ValueError("Choose at least one CSV dataset.")
+        for table, rows in batches.items():
+            if table not in TABLE_COLUMNS:
+                raise ValueError("Only operational datasets can be imported.")
+            self._require(token, table, "write")
+            if not isinstance(rows, list) or not rows:
+                raise ValueError(f"{table}: the CSV must contain at least one record.")
+        if sum(len(rows) for rows in batches.values()) > 10000:
+            raise ValueError("Import at most 10,000 records at a time.")
+        errors, summary = [], []
+        order = ("workers", "equipment", "incidents", "maintenance", "risks", "readings")
+        with self._connect() as connection:
+            connection.execute("BEGIN IMMEDIATE")
+            for table in order:
+                if table not in batches:
+                    continue
+                created, updated, seen = 0, 0, set()
+                for index, values in enumerate(batches[table], 2):
+                    try:
+                        row = self._validated_record(table, values)
+                        if row["id"] in seen:
+                            raise ValueError(f"ID {row['id']} appears more than once in this CSV.")
+                        seen.add(row["id"])
+                        exists = connection.execute(f"SELECT id FROM {table} WHERE id=?", (row["id"],)).fetchone()
+                        if exists and not update_existing:
+                            raise ValueError(f"ID {row['id']} already exists. Choose update mode to edit it.")
+                        columns = TABLE_COLUMNS[table]
+                        if exists:
+                            changed = columns[1:]
+                            connection.execute(f"UPDATE {table} SET {','.join(key+'=?' for key in changed)} WHERE id=?",
+                                               [row[key] for key in changed] + [row["id"]])
+                            updated += 1
+                        else:
+                            connection.execute(f"INSERT INTO {table}({','.join(columns)}) VALUES({','.join('?' for _ in columns)})",
+                                               [row[key] for key in columns])
+                            created += 1
+                    except (ValueError, sqlite3.IntegrityError) as error:
+                        message = str(error)
+                        if isinstance(error, sqlite3.IntegrityError):
+                            message = ("This equipment already has a reading on that date. Update that reading's existing ID."
+                                       if "readings.equipment_id, readings.date" in message
+                                       else "Referenced worker/equipment ID does not exist. Include its parent dataset or use an existing ID.")
+                        errors.append({"Dataset": table, "CSV record": index, "Problem": message})
+                        if len(errors) >= 100:
+                            break
+                summary.append({"Dataset": table, "New records": created, "Updated records": updated})
+                if len(errors) >= 100:
+                    break
+            if errors or dry_run:
+                connection.rollback()
+        return {"errors": errors, "summary": summary, "saved": not errors and not dry_run}
+
     def delete_record(self, token, table, record_id):
         """Delete an authorized record while preserving referenced workers/equipment."""
         self._require(token, table, "write")

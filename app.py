@@ -13,6 +13,7 @@ import plotly.express as px
 import streamlit as st
 
 from service import MiningService
+from csv_import import import_page
 
 
 DEPARTMENTS = ["Extraction", "Processing", "Engineering", "Logistics"]
@@ -203,6 +204,8 @@ def sidebar(service, token, user):
             if service.can(token, table):
                 pages[label] = table
         pages.update({"Alerts": None, "Analytics & reports": None})
+        if any(service.can(token, table, "write") for table in TABLE_LABELS):
+            pages["Import CSV data"] = None
         if user["role"] == "Administrator":
             pages["Users"] = None
         page = st.radio("Workspace", list(pages), key="navigation")
@@ -835,6 +838,8 @@ def main():
             alerts_page(service, token, start, end)
         elif page == "Analytics & reports":
             analytics_page(service, token, start, end)
+        elif page == "Import CSV data":
+            import_page(service, token)
         elif page == "Users":
             users_page(service, token, user)
     except PermissionError as error:
